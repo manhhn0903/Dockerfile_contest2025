@@ -666,7 +666,10 @@ CMD ["/server"]
 # Giai đoạn 1: Node base
 # =========================
 # Môi trường build cho Vite/React: chỉ cài những thứ tối thiểu để biên dịch
+# Dùng Alpine Linux 3.20 làm base image, khóa chặt image bằng digest (không cho thay đổi)
+
 FROM alpine:3.20@sha256:765942a4039992336de8dd5db680586e1a206607dd06170ff0a37267a9e01958 AS node-base
+# Cài Node + công cụ build native module, dọn cache
 RUN apk add --no-cache nodejs npm git python3 g++ make && \
     npm install -g pnpm@9.12.2 && npm cache clean --force
 
@@ -674,18 +677,33 @@ RUN apk add --no-cache nodejs npm git python3 g++ make && \
 # Giai đoạn 2: Builder
 # =========================
 # Dùng cache mount cho pnpm để tăng tốc build lại; xóa source map; nén gzip sẵn
+
 FROM node-base AS builder
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
+
+# tính năng của Docker BuildKit, cho phép gắn (mount) một thư mục cache vào container chỉ trong lúc build. là cache riêng của BuildKit, KHÁC với cache trong image.
+# id=pnpm-custom, Tên cache, có thể đặt bất kỳ tên nào.
+# target=/root/.local/share/pnpm/store, là đường dẫn store của pnpm trong Alpine/Node, Các lần build sau dùng lại pnpm store, build nhanh hơn 10–20 lần.
+# --frozen-lockfile, Chỉ cài đúng theo pnpm-lock.yaml, k thay đổi lockfile, Báo lỗi nếu lockfile khác dependencies
+# --prefer-offline, Ưu tiên dùng cache, Không tải lại package từ registry nếu đã có trong store
+# Kết hợp với BuildKit cache = siêu nhanh.
+
 RUN --mount=type=cache,id=pnpm-custom,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile --prefer-offline
+    
 # Sao chép cấu hình & mã nguồn
 COPY index.html ./
 COPY vite.config.ts tsconfig.json tsconfig.node.json ./
 COPY postcss.config.js tailwind.config.ts ./
 COPY public ./public
 COPY src ./src
+
 # Build & tối ưu artefact tĩnh
+# pnpm run build Chạy script build được định nghĩa trong package.json. Thường với Vite/React/Vue: tạo ra thư mục dist/ chứa code đã build. Output: dist/ chứa .html, .js, .css, asset… sẵn sàng để deploy.
+# find /app/dist -name "*.map" -type f -delete || true find /app/dist → tìm tất cả file trong thư mục /app/dist. -name "*.map" → chỉ file kết thúc bằng .map (source map). -type f → chỉ tìm file, bỏ qua thư mục. -delete → xóa những file .map. Source map giúp debug code nhưng không cần thiết trong production, nên xóa để giảm size image. || true → tránh lỗi nếu không tìm thấy file .map nào. Nếu không có file .map, find ... -delete trả về non-zero exit code → Docker build fail. || true sẽ bỏ qua lỗi này.
+# find /app/dist -type f → tìm tất cả file. \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' \) Chỉ chọn file html, js, css, svg, json -o = OR (hoặc) Dấu \( và \) để group điều kiện trong find. -exec gzip -k -9 {} \; gzip → nén file bằng gzip. -k → giữ lại file gốc, tạo thêm file .gz. -9 → mức nén tối đa. {} → đại diện cho từng file được find tìm ra. \; → kết thúc lệnh -exec. Kết quả: trong dist/ sẽ có file gốc + file .gz tương ứng (ví dụ index.html và index.html.gz). Điều này tiện cho web server hoặc CDN hỗ trợ nén gzip, cải thiện tốc độ tải.
+
 RUN pnpm run build && \
     find /app/dist -name "*.map" -type f -delete || true && \
     find /app/dist -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '*.svg' -o -name '*.json' \) \
@@ -696,6 +714,13 @@ RUN pnpm run build && \
 # ======================================
 # Biên dịch nginx 1.27.3 với module tối thiểu cho SPA + nén tĩnh
 FROM alpine:3.20@sha256:765942a4039992336de8dd5db680586e1a206607dd06170ff0a37267a9e01958 AS nginx-builder
+
+# apk add --no-cache → cài gói trên Alpine mà không lưu cache, giảm size image. --virtual .build-deps → tạo tập hợp gói tạm thời có tên .build-deps, dễ xóa sau khi build. Gói cần thiết: gcc, libc-dev, make → compiler C và công cụ build pcre2-dev → regex module cho Nginx zlib-dev → gzip / nén openssl-dev → SSL/TLS module linux-headers → header kernel, cần khi build module
+# Download Nginx 1.27.3 từ trang chính thức. Giải nén vào /tmp → tạo thư mục /tmp/nginx-1.27.3. cd /tmp/nginx-1.27.3 → chuẩn bị build.
+# tùy chỉnh Nginx build từ source để chỉ giữ module cần.từ chỗ ./configure \ . --prefix=/etc/nginx → thư mục cài chính. --sbin-path=/usr/sbin/nginx → đường dẫn binary nginx. --modules-path=/usr/lib/nginx/modules → nơi lưu module. --conf-path=/etc/nginx/nginx.conf → file cấu hình. --error-log-path / --http-log-path → nơi lưu log. --pid-path / --lock-path → PID file và lock file. --http-client-body-temp-path / --http-proxy-temp-path → temp directory cho body/proxy. --user=nginx --group=nginx → chạy nginx dưới user nginx. --with-* → build các module cần thiết: SSL, HTTP/2, gzip static, stub_status… --without-* → loại bỏ module không cần, giảm size, tăng bảo mật.
+# make -j$(nproc) → build Nginx, dùng tất cả core CPU để tăng tốc. make install → cài binary, config, module vào các đường dẫn đã chỉ định.
+# strip /usr/sbin/nginx → loại bỏ debug symbols → giảm size binary. rm -rf /tmp/nginx* → xóa source code và tarball → giảm size image. apk del .build-deps → gỡ toàn bộ gói build tạm thời → giữ image nhẹ nhất có thể.
+
 RUN apk add --no-cache --virtual .build-deps gcc libc-dev make pcre2-dev zlib-dev openssl-dev linux-headers && \
     wget -O /tmp/nginx.tar.gz https://nginx.org/download/nginx-1.27.3.tar.gz && \
     tar -xzf /tmp/nginx.tar.gz -C /tmp && cd /tmp/nginx-1.27.3 && \
@@ -729,6 +754,14 @@ RUN apk add --no-cache --virtual .build-deps gcc libc-dev make pcre2-dev zlib-de
 # ======================================
 # Chỉ giữ runtime deps; tạo user non-root; chuẩn bị thư mục và quyền
 FROM alpine:3.20@sha256:765942a4039992336de8dd5db680586e1a206607dd06170ff0a37267a9e01958 AS custom-runtime-base
+
+# Nginx chỉ cần các thư viện runtime chứ không cần thư viện build nữa. pcre2 → dùng cho rewrite, regex (URL rewrite, rewrite rules). zlib → hỗ trợ gzip, deflate. openssl → hỗ trợ HTTPS / TLS. tzdata → dữ liệu múi giờ (nếu app dùng logging phụ thuộc timezone).
+# Tạo user & group 'nginx' an toàn. Tại sao cần tạo user nginx thủ công? → Vì Alpine không có sẵn user "nginx", và chạy Nginx bằng user không phải root là best practice bảo mật. Nginx bây giờ chạy dưới user nginx, không phải root.
+# Nginx cần các thư mục: /var/cache/nginx → cache, body temp, proxy temp /var/log/nginx → access.log + error.log /etc/nginx/conf.d → nơi bạn đặt file config tùy chỉnh (.conf) /usr/share/nginx/html → thư mục chứa trang tĩnh hoặc front-end app
+# Nếu bạn không đổi quyền sở hữu: Nginx không thể ghi log Không thể lưu file body temp Không thể lưu file cache proxy → Nginx sẽ crash hoặc báo lỗi permission denied. Vậy nên quyền sở hữu được chuyển sang nginx:nginx.
+# Lấy binary nginx đã được build từ stage nginx-builder. Binary này đã được compile tối ưu, strip để nhẹ nhất. Bạn không cần build lại trong runtime image.
+# Lấy toàn bộ file cấu hình từ stage builder Bao gồm: nginx.conf mime.types module configs temp file path settings Điều này giữ config nhất quán giữa stage build và stage runtime.
+
 RUN apk add --no-cache pcre2 zlib openssl tzdata && \
     addgroup -g 101 -S nginx && \
     adduser -S -D -H -u 101 -h /var/cache/nginx -s /sbin/nologin -G nginx -g nginx nginx && \
@@ -740,6 +773,9 @@ COPY --from=nginx-builder /etc/nginx /etc/nginx
 # ======================================
 # Giai đoạn 5: Runtime cuối
 # ======================================
+
+# ĐOẠN NÀY = TẠO IMAGE RUNTIME CUỐI + THÊM METADATA CHUẨN OCI Nó chuẩn bị môi trường cuối để: nhận file dist/ từ stage build chạy Nginx phục vụ SPA production trở thành image chính mà bạn deploy
+
 FROM custom-runtime-base AS runtime
 LABEL org.opencontainers.image.title="SvnFrs-Dockerfile_Contest_2025" \
       org.opencontainers.image.description="SPA production trên Alpine với Nginx tự biên dịch, tối ưu và bảo mật" \
@@ -748,10 +784,17 @@ LABEL org.opencontainers.image.title="SvnFrs-Dockerfile_Contest_2025" \
       org.opencontainers.image.created="2025-10-28" \
       org.opencontainers.image.base.name="alpine:3.20"
 
-# Ứng dụng tĩnh đã build
+# Ứng dụng tĩnh đã build. Dòng này copy thành phẩm SPA đã build vào thư mục web của Nginx và đảm bảo Nginx (user non-root) có quyền truy cập để phục vụ website.
 COPY --from=builder --chown=nginx:nginx /app/dist /usr/share/nginx/html
 
 # Cấu hình Nginx tối thiểu (inline) bật gzip_static để phục vụ file .gz
+
+# Server block Nginx phục vụ SPA - Lắng nghe port 3000 - Root = /usr/share/nginx/html - Gzip static - Cấu hình cache 1 năm cho file tĩnh, no-cache cho index.html - SPA routing (try_files $uri $uri/ /index.html) - Security headers (X-Frame-Options, X-Content-Type-Options, X-XSS-Protection)
+
+# Cấu hình Nginx tổng thể (master config) - Số worker tự động theo CPU - Đường dẫn log và pid - Số kết nối tối đa per worker - Load tất cả file .conf trong /etc/nginx/conf.d - Bật sendfile, keepalive_timeout
+
+# Định nghĩa MIME types cho file tĩnh - Gán đúng content-type cho HTML, CSS, JS, JSON, SVG, ICO, PNG, JPEG, WOFF2, WASM… - Đảm bảo browser hiểu đúng kiểu file khi serve
+
 RUN echo 'server { \
   listen 3000; server_name localhost; \
   root /usr/share/nginx/html; index index.html; \
@@ -771,6 +814,8 @@ echo 'types { \
 }' > /etc/nginx/mime.types
 
 # Thư mục tạm/ngầm của Nginx + phân quyền trước khi chuyển USER
+# Đoạn này chuẩn bị tất cả thư mục tạm (temp) và quyền sở hữu cần thiết cho Nginx chạy ổn định, đặc biệt khi chạy dưới user nginx không phải root. Đoạn này chuẩn bị toàn bộ thư mục temp + quyền sở hữu + PID cho Nginx chạy non-root, đảm bảo không lỗi permission, chạy ổn định trong container production.
+
 RUN mkdir -p /var/cache/nginx/client_temp \
              /var/cache/nginx/proxy_temp \
              /etc/nginx/fastcgi_temp \
@@ -796,6 +841,11 @@ RUN mkdir -p /var/cache/nginx/client_temp \
     chown nginx:nginx /var/run/nginx.pid
 
 # Healthcheck rẻ: HTTP 200 ở cổng 3000
+# apk là package manager của Alpine Linux. --no-cache để không lưu cache, giúp image nhẹ hơn. Mục đích: cài wget để kiểm tra trạng thái container trong lệnh HEALTHCHECK.
+# HEALTHCHECK cho Docker biết container có "sống" hay không. Tham số: --interval=30s → kiểm tra mỗi 30 giây --timeout=3s → nếu không có phản hồi trong 3 giây → coi là fail --start-period=5s → đợi 5 giây sau khi start mới bắt đầu check --retries=3 → thử 3 lần trước khi mark container unhealthy. --spider → chỉ kiểm tra URL, không tải file || exit 1 → nếu wget fail → healthcheck fail ✅ Mục đích: Docker / Kubernetes biết container ready để serve SPA hay chưa.
+
+# STOPSIGNAL SIGQUIT: Khi Docker stop container → gửi tín hiệu SIGQUIT thay vì mặc định SIGTERM. SIGQUIT cho Nginx → shutdown an toàn, ghi PID log, đóng worker.
+
 RUN apk add --no-cache wget
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget --quiet --tries=1 --spider http://localhost:3000/ || exit 1
